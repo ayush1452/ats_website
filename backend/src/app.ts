@@ -6,17 +6,27 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { MAX_FILE_BYTES } from "./config/constants.js";
 import { readEnvironment, type Environment } from "./config/env.js";
 import { analysesRoutes } from "./routes/analyses.js";
-import { systemRoutes } from "./routes/system.js";
+import { scansRoutes } from "./routes/scans.js";
+import { systemRoutes, type ReadinessCheck } from "./routes/system.js";
+import { InlineJobQueue } from "./queue/inline-queue.js";
+import type { JobQueue } from "./queue/types.js";
+import { InMemoryScanStore } from "./scans/memory-store.js";
+import type { ScanStore } from "./scans/types.js";
 import {
   createAnalysisService,
   type AnalysisService,
   type SemanticAiProvider
 } from "./services/analysis.js";
+import { createScanProcessor } from "./services/scan-processor.js";
 
 export type AppDependencies = {
   env?: Environment;
   aiProvider?: SemanticAiProvider;
   analysisService?: AnalysisService;
+  scanStore?: ScanStore;
+  jobQueue?: JobQueue;
+  /** Extra readiness probes (e.g. database, object storage) for /readyz. */
+  readinessChecks?: ReadinessCheck[];
   createId?: () => string;
   now?: () => Date;
 };
@@ -25,6 +35,19 @@ export async function buildApp(dependencies: AppDependencies = {}): Promise<Fast
   const env = dependencies.env ?? readEnvironment();
   const analysisService =
     dependencies.analysisService ?? createAnalysisService(dependencies.aiProvider);
+  const scanStore = dependencies.scanStore ?? new InMemoryScanStore();
+  const jobQueue = dependencies.jobQueue ?? new InlineJobQueue();
+  await jobQueue.start(
+    createScanProcessor({
+      scanStore,
+      analysisService,
+      ...(dependencies.now === undefined ? {} : { now: dependencies.now })
+    })
+  );
+  const readinessChecks: ReadinessCheck[] = [
+    { name: "queue", check: () => jobQueue.healthCheck() },
+    ...(dependencies.readinessChecks ?? [])
+  ];
   const app = Fastify({
     trustProxy: env.TRUST_PROXY,
     bodyLimit: MAX_FILE_BYTES + 256 * 1024,
@@ -88,12 +111,26 @@ export async function buildApp(dependencies: AppDependencies = {}): Promise<Fast
     }
   });
 
-  await app.register(systemRoutes, { analysisService });
+  await app.register(systemRoutes, { analysisService, readinessChecks });
   await app.register(analysesRoutes, {
     allowedOrigin: env.FRONTEND_ORIGIN,
     analysisService,
     ...(dependencies.createId === undefined ? {} : { createId: dependencies.createId }),
     ...(dependencies.now === undefined ? {} : { now: dependencies.now })
+  });
+  await app.register(scansRoutes, {
+    allowedOrigin: env.FRONTEND_ORIGIN,
+    analysisService,
+    scanStore,
+    jobQueue,
+    ...(dependencies.createId === undefined ? {} : { createId: dependencies.createId }),
+    ...(dependencies.now === undefined ? {} : { now: dependencies.now })
+  });
+
+  // Stop consuming jobs when the server closes. The queue owns only its worker;
+  // shared resources (Prisma, storage) are closed by whoever created them.
+  app.addHook("onClose", async () => {
+    await jobQueue.stop();
   });
 
   return app;
